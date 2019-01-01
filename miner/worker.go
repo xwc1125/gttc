@@ -17,7 +17,6 @@
 package miner
 
 import (
-	"errors"
 	"fmt"
 	"math/big"
 	"sync"
@@ -508,7 +507,7 @@ func (self *worker) commitNewWork() {
 	self.push(work)
 	self.updateSnapshot()
 
-	if self.config.Alien != nil {
+	if self.config.Alien != nil && !self.config.Alien.SideChain {
 		err = self.sendConfirmTx(parent.Number())
 		if err != nil {
 			log.Info("Fail to Sign the transaction by coinbase", "err", err)
@@ -525,7 +524,7 @@ func (self *worker) sendConfirmTx(blockNumber *big.Int) error {
 	wallets := self.eth.AccountManager().Wallets()
 	// wallets check
 	if len(wallets) == 0 {
-		return errors.New("No wallets")
+		return nil
 	}
 	for _, wallet := range wallets {
 		if len(wallet.Accounts()) == 0 {

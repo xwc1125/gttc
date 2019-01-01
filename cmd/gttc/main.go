@@ -35,7 +35,9 @@ import (
 	"github.com/TTCECO/gttc/log"
 	"github.com/TTCECO/gttc/metrics"
 	"github.com/TTCECO/gttc/node"
+	"github.com/TTCECO/gttc/rpc"
 	"gopkg.in/urfave/cli.v1"
+	"strconv"
 )
 
 const (
@@ -140,6 +142,13 @@ var (
 		utils.WhisperMaxMessageSizeFlag,
 		utils.WhisperMinPOWFlag,
 	}
+
+	scaFlags = []cli.Flag{
+		utils.SCAEnableFlag,
+		utils.SCAMainRPCAddrFlag,
+		utils.SCAMainRPCPortFlag,
+		utils.SCAPeriod,
+	}
 )
 
 func init() {
@@ -182,6 +191,7 @@ func init() {
 	app.Flags = append(app.Flags, consoleFlags...)
 	app.Flags = append(app.Flags, debug.Flags...)
 	app.Flags = append(app.Flags, whisperFlags...)
+	app.Flags = append(app.Flags, scaFlags...)
 
 	app.Before = func(ctx *cli.Context) error {
 		runtime.GOMAXPROCS(runtime.NumCPU())
@@ -279,6 +289,24 @@ func startNode(ctx *cli.Context, stack *node.Node) {
 			}
 		}
 	}()
+	// Set Side chain config
+	if ctx.GlobalBool(utils.SCAEnableFlag.Name) {
+		var ethereum *eth.Ethereum
+		if err := stack.Service(&ethereum); err != nil {
+			utils.Fatalf("Ethereum service not running: %v", err)
+		}
+		mcRPCAddress := ctx.GlobalString(utils.SCAMainRPCAddrFlag.Name)
+		mcRPCPort := ctx.GlobalInt(utils.SCAMainRPCPortFlag.Name)
+		mcPeriod := ctx.GlobalInt(utils.SCAPeriod.Name)
+		client, err := rpc.Dial("http://" + mcRPCAddress + ":" + strconv.Itoa(mcRPCPort))
+		if err != nil {
+			utils.Fatalf("Main net rpc connect fail: %v", err)
+		}
+		ethereum.BlockChain().Config().Alien.SideChain = true
+		ethereum.BlockChain().Config().Alien.Period = uint64(mcPeriod)
+		ethereum.BlockChain().Config().Alien.MCRPCClient = client
+	}
+
 	// Start auxiliary services if enabled
 	if ctx.GlobalBool(utils.MiningEnabledFlag.Name) || ctx.GlobalBool(utils.DeveloperFlag.Name) {
 		// Mining only makes sense if a full Ethereum node is running

@@ -1,4 +1,4 @@
-// Copyright 2017 The gttc Authors
+// Copyright 2018 The gttc Authors
 // This file is part of the gttc library.
 //
 // The gttc library is free software: you can redistribute it and/or modify
@@ -21,15 +21,16 @@ package alien
 import (
 	"encoding/json"
 	"errors"
-	"math/big"
-	"time"
-
 	"github.com/TTCECO/gttc/common"
 	"github.com/TTCECO/gttc/core/types"
 	"github.com/TTCECO/gttc/ethdb"
 	"github.com/TTCECO/gttc/params"
-	"github.com/TTCECO/gttc/rlp"
 	"github.com/hashicorp/golang-lru"
+	"math/big"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
 )
 
 const (
@@ -43,12 +44,37 @@ const (
 	defaultOfficialSecondLevelCount = 20   // official second level, 60% in signer queue
 	defaultOfficialThirdLevelCount  = 30   // official third level, 40% in signer queue
 	// the credit of one signer is at least minCalSignerQueueCredit
-	candidateNormal = 1
+	candidateStateNormal = 1
+	candidateMaxLen      = 500 // if candidateNeedPD is false and candidate is more than candidateMaxLen, then minimum tickets candidates will be remove in each LCRS*loop
+	// reward for side chain
+	scRewardDelayLoopCount   = 2                          //
+	scRewardExpiredLoopCount = scRewardDelayLoopCount + 4 //
+	scMaxCountPerPeriod      = 6
 )
 
 var (
 	errIncorrectTallyCount = errors.New("incorrect tally count")
 )
+
+// SCCurrentBlockReward is base on scMaxCountPerPeriod = 6
+var SCCurrentBlockReward = map[uint64]map[uint64]uint64{1: {1: 100},
+	2: {1: 30, 2: 70},
+	3: {1: 15, 2: 30, 3: 55},
+	4: {1: 5, 2: 15, 3: 30, 4: 50},
+	5: {1: 5, 2: 10, 3: 15, 4: 25, 5: 45},
+	6: {1: 1, 2: 4, 3: 10, 4: 15, 5: 25, 6: 45}}
+
+// SCReward
+type SCReward = map[uint64]map[common.Address]uint64 //sum(this value) in one period == 100
+
+// SCRecord is the state record for side chain
+type SCRecord struct {
+	Record              map[uint64][]*SCConfirmation `json:"record"`              // Confirmation Record of one side chain
+	LastConfirmedNumber uint64                       `json:"lastConfirmedNumber"` // Last confirmed header number of one side chain
+	MaxHeaderNumber     uint64                       `json:"maxHeaderNumber"`     // max header number of one side chain
+	CountPerPeriod      uint64                       `json:"countPerPeriod"`      // block sealed per period on this side chain
+	RewardPerPeriod     uint64                       `json:"rewardPerPeriod"`     // full reward per period
+}
 
 // Snapshot is the state of the authorization voting at a given point in time.
 type Snapshot struct {
@@ -56,6 +82,7 @@ type Snapshot struct {
 	sigcache *lru.ARCCache       // Cache of recent block signatures to speed up ecrecover
 	LCRS     uint64              // Loop count to recreate signers from top tally
 
+	Period          uint64                       `json:"period"`          // Period of seal each block
 	Number          uint64                       `json:"number"`          // Block number where the snapshot was created
 	ConfirmedNumber uint64                       `json:"confirmedNumber"` // Block number confirmed when the snapshot was created
 	Hash            common.Hash                  `json:"hash"`            // Block hash where the snapshot was created
@@ -70,6 +97,10 @@ type Snapshot struct {
 	Proposals       map[common.Hash]*Proposal    `json:"proposals"`       // The Proposals going or success (failed proposal will be removed)
 	HeaderTime      uint64                       `json:"headerTime"`      // Time of the current header
 	LoopStartTime   uint64                       `json:"loopStartTime"`   // Start Time of the current loop
+
+	SCCoinbase     map[common.Address]map[common.Hash]common.Address `json:"sideChainCoinbase"`     // Coinbase of side chain setting
+	SCConfirmation map[common.Hash]*SCRecord                         `json:"sideChainConfirmation"` // Confirmation of side chain setting
+	SCAllReward    map[common.Hash]SCReward                          `json:"sideChainReward"`       // Side Chain Reward
 }
 
 // newSnapshot creates a new snapshot with the specified startup parameters. only ever use if for
@@ -80,6 +111,7 @@ func newSnapshot(config *params.AlienConfig, sigcache *lru.ARCCache, hash common
 		config:          config,
 		sigcache:        sigcache,
 		LCRS:            lcrs,
+		Period:          config.Period,
 		Number:          0,
 		ConfirmedNumber: 0,
 		Hash:            hash,
@@ -94,8 +126,10 @@ func newSnapshot(config *params.AlienConfig, sigcache *lru.ARCCache, hash common
 		Proposals:       make(map[common.Hash]*Proposal),
 		HeaderTime:      uint64(time.Now().Unix()) - 1,
 		LoopStartTime:   config.GenesisTimestamp,
+		SCCoinbase:      make(map[common.Address]map[common.Hash]common.Address),
+		SCConfirmation:  make(map[common.Hash]*SCRecord),
+		SCAllReward:     make(map[common.Hash]SCReward),
 	}
-
 	snap.HistoryHash = append(snap.HistoryHash, hash)
 
 	for _, vote := range votes {
@@ -110,7 +144,7 @@ func newSnapshot(config *params.AlienConfig, sigcache *lru.ARCCache, hash common
 		// init Voters
 		snap.Voters[vote.Voter] = big.NewInt(0) // block number is 0 , vote in genesis block
 		// init Candidates
-		snap.Candidates[vote.Voter] = candidateNormal
+		snap.Candidates[vote.Voter] = candidateStateNormal
 	}
 
 	for i := 0; i < int(config.MaxSignerCount); i++ {
@@ -150,6 +184,7 @@ func (s *Snapshot) copy() *Snapshot {
 		config:          s.config,
 		sigcache:        s.sigcache,
 		LCRS:            s.LCRS,
+		Period:          s.Period,
 		Number:          s.Number,
 		ConfirmedNumber: s.ConfirmedNumber,
 		Hash:            s.Hash,
@@ -164,8 +199,11 @@ func (s *Snapshot) copy() *Snapshot {
 		Proposals:     make(map[common.Hash]*Proposal),
 		Confirmations: make(map[uint64][]*common.Address),
 
-		HeaderTime:    s.HeaderTime,
-		LoopStartTime: s.LoopStartTime,
+		HeaderTime:     s.HeaderTime,
+		LoopStartTime:  s.LoopStartTime,
+		SCCoinbase:     make(map[common.Address]map[common.Hash]common.Address),
+		SCConfirmation: make(map[common.Hash]*SCRecord),
+		SCAllReward:    make(map[common.Hash]SCReward),
 	}
 	copy(cpy.HistoryHash, s.HistoryHash)
 	copy(cpy.Signers, s.Signers)
@@ -194,6 +232,35 @@ func (s *Snapshot) copy() *Snapshot {
 	}
 	for txHash, proposal := range s.Proposals {
 		cpy.Proposals[txHash] = proposal.copy()
+	}
+	for signer, sc := range s.SCCoinbase {
+		cpy.SCCoinbase[signer] = make(map[common.Hash]common.Address)
+		for hash, addr := range sc {
+			cpy.SCCoinbase[signer][hash] = addr
+		}
+	}
+	for hash, scc := range s.SCConfirmation {
+		cpy.SCConfirmation[hash] = &SCRecord{
+			LastConfirmedNumber: scc.LastConfirmedNumber,
+			MaxHeaderNumber:     scc.MaxHeaderNumber,
+			CountPerPeriod:      scc.CountPerPeriod,
+			RewardPerPeriod:     scc.RewardPerPeriod,
+			Record:              make(map[uint64][]*SCConfirmation),
+		}
+		for number, scConfirmation := range scc.Record {
+			cpy.SCConfirmation[hash].Record[number] = make([]*SCConfirmation, len(scConfirmation))
+			copy(cpy.SCConfirmation[hash].Record[number], scConfirmation)
+		}
+	}
+
+	for hash, sca := range s.SCAllReward {
+		cpy.SCAllReward[hash] = make(map[uint64]map[common.Address]uint64)
+		for number, reward := range sca {
+			cpy.SCAllReward[hash][number] = make(map[common.Address]uint64)
+			for addr, count := range reward {
+				cpy.SCAllReward[hash][number][addr] = count
+			}
+		}
 	}
 
 	return cpy
@@ -229,7 +296,7 @@ func (s *Snapshot) apply(headers []*types.Header) (*Snapshot, error) {
 		}
 
 		headerExtra := HeaderExtra{}
-		err = rlp.DecodeBytes(header.Extra[extraVanity:len(header.Extra)-extraSeal], &headerExtra)
+		err = decodeHeaderExtra(s.config, header.Number, header.Extra[extraVanity:len(header.Extra)-extraSeal], &headerExtra)
 		if err != nil {
 			return nil, err
 		}
@@ -262,9 +329,27 @@ func (s *Snapshot) apply(headers []*types.Header) (*Snapshot, error) {
 		// deal proposals
 		snap.updateSnapshotByProposals(headerExtra.CurrentBlockProposals, header.Number)
 
-		// deal declares decisionTypeImmediately
+		// deal declares
 		snap.updateSnapshotByDeclares(headerExtra.CurrentBlockDeclares, header.Number)
-		// todo :deal declares decisionTypeWaitTillEnd
+
+		// deal trantor upgrade
+		if snap.Period == 0 && snap.config.IsTrantor(header.Number) {
+			snap.Period = snap.config.Period
+		}
+
+		// deal setcoinbase for side chain
+		snap.updateSnapshotBySetSCCoinbase(headerExtra.SideChainSetCoinbases)
+
+		// deal confirmation for side chain
+		snap.updateSnapshotBySCConfirm(headerExtra.SideChainConfirmations, header.Number)
+
+		// calculate proposal result
+		snap.calculateProposalResult(header.Number)
+
+		// check the len of candidate if not candidateNeedPD
+		if !candidateNeedPD && (snap.Number+1)%(snap.config.MaxSignerCount*snap.LCRS) == 0 && len(snap.Candidates) > candidateMaxLen {
+			snap.removeExtraCandidate()
+		}
 
 	}
 	snap.Number += uint64(len(headers))
@@ -276,6 +361,21 @@ func (s *Snapshot) apply(headers []*types.Header) (*Snapshot, error) {
 		return nil, err
 	}
 	return snap, nil
+}
+
+func (s *Snapshot) removeExtraCandidate() {
+	// remove minimum tickets tally beyond candidateMaxLen
+	tallySlice := s.buildTallySlice()
+	sort.Sort(TallySlice(tallySlice))
+	if len(tallySlice) > candidateMaxLen {
+		removeNeedTally := tallySlice[candidateMaxLen:]
+		for _, tallySlice := range removeNeedTally {
+			if _, ok := s.SCCoinbase[tallySlice.addr]; ok {
+				delete(s.SCCoinbase, tallySlice.addr)
+			}
+			delete(s.Candidates, tallySlice.addr)
+		}
+	}
 }
 
 func (s *Snapshot) verifyTallyCnt() error {
@@ -300,11 +400,173 @@ func (s *Snapshot) verifyTallyCnt() error {
 	return nil
 }
 
+func (s *Snapshot) updateSnapshotBySetSCCoinbase(scCoinbases []SCSetCoinbase) {
+	for _, scc := range scCoinbases {
+		if _, ok := s.SCCoinbase[scc.Signer]; !ok {
+			s.SCCoinbase[scc.Signer] = make(map[common.Hash]common.Address)
+		}
+		s.SCCoinbase[scc.Signer][scc.Hash] = scc.Coinbase
+	}
+}
+
+func (s *Snapshot) isSideChainCoinbase(sc common.Hash, address common.Address) bool {
+	// check is side chain coinbase
+	// is use the coinbase of main chain as coinbase of side chain , return false
+	// the main chain cloud seal block, but not recommend for send confirm tx usually fail
+	for _, coinbaseMap := range s.SCCoinbase {
+		if coinbase, ok := coinbaseMap[sc]; ok && coinbase == address {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Snapshot) updateSnapshotBySCConfirm(scConfirmations []SCConfirmation, headerNumber *big.Int) {
+	// todo ,if diff side chain coinbase send confirm for the same side chain , same number ...
+	for _, scc := range scConfirmations {
+		// new confirmation header number must larger than last confirmed number of this side chain
+		if s.isSideChainCoinbase(scc.Hash, scc.Coinbase) {
+			if _, ok := s.SCConfirmation[scc.Hash]; ok && scc.Number > s.SCConfirmation[scc.Hash].LastConfirmedNumber {
+				s.SCConfirmation[scc.Hash].Record[scc.Number] = append(s.SCConfirmation[scc.Hash].Record[scc.Number], scc.copy())
+				if scc.Number > s.SCConfirmation[scc.Hash].MaxHeaderNumber {
+					s.SCConfirmation[scc.Hash].MaxHeaderNumber = scc.Number
+				}
+			}
+		}
+	}
+	// calculate the side chain reward in each loop
+	if (headerNumber.Uint64()+1)%s.config.MaxSignerCount == 0 {
+		s.updateSCConfirmation(headerNumber)
+	}
+}
+
+func (s *Snapshot) calculateConfirmedNumber(record *SCRecord, minConfirmedSignerCount int) (uint64, map[uint64]common.Address) {
+	// todo : add params scHash, so can check if the address in SCRecord is belong to this side chain
+
+	confirmedNumber := record.LastConfirmedNumber
+	confirmedRecordMap := make(map[string]map[common.Address]bool)
+	confirmedCoinbase := make(map[uint64]common.Address)
+	sep := ":"
+	for i := record.LastConfirmedNumber + 1; i <= record.MaxHeaderNumber; i++ {
+		if _, ok := record.Record[i]; ok {
+			// during reorged, the side chain loop info may more than one for each side chain block number.
+			for _, scConfirm := range record.Record[i] {
+				// loopInfo slice contain number and coinbase address of side chain block,
+				// so the length of loop info must larger than twice of minConfirmedSignerCount .
+				if len(scConfirm.LoopInfo) >= minConfirmedSignerCount*2 {
+					key := strings.Join(scConfirm.LoopInfo, sep)
+					if _, ok := confirmedRecordMap[key]; !ok {
+						confirmedRecordMap[key] = make(map[common.Address]bool)
+					}
+					// new coinbase for same loop info
+					if _, ok := confirmedRecordMap[key][scConfirm.Coinbase]; !ok {
+						confirmedRecordMap[key][scConfirm.Coinbase] = true
+						if len(confirmedRecordMap[key]) >= minConfirmedSignerCount {
+							headerNum, err := strconv.Atoi(scConfirm.LoopInfo[len(scConfirm.LoopInfo)-2])
+							if err == nil && uint64(headerNum) > confirmedNumber {
+								confirmedNumber = uint64(headerNum)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	for info, count := range confirmedRecordMap {
+		if len(count) >= minConfirmedSignerCount {
+			infos := strings.Split(info, sep)
+			for i := 0; i+1 < len(infos); i += 2 {
+				number, err := strconv.Atoi(infos[i])
+				if err != nil {
+					continue
+				}
+				confirmedCoinbase[uint64(number)] = common.HexToAddress(infos[i+1])
+			}
+		}
+	}
+
+	return confirmedNumber, confirmedCoinbase
+}
+
+func (s *Snapshot) calculateCurrentBlockReward(currentCount uint64, periodCount uint64) uint64 {
+	currentRewardPercentage := uint64(0)
+	if periodCount > uint64(scMaxCountPerPeriod) {
+		periodCount = scMaxCountPerPeriod
+	}
+	if v, ok := SCCurrentBlockReward[periodCount][currentCount]; ok {
+		currentRewardPercentage = v
+	}
+	return currentRewardPercentage
+}
+
+func (s *Snapshot) updateSCConfirmation(headerNumber *big.Int) {
+	minConfirmedSignerCount := int(2 * s.config.MaxSignerCount / 3)
+	for scHash, record := range s.SCConfirmation {
+		if _, ok := s.SCAllReward[scHash]; !ok {
+			s.SCAllReward[scHash] = make(map[uint64]map[common.Address]uint64)
+		}
+		if _, ok := s.SCAllReward[scHash][headerNumber.Uint64()]; !ok {
+			s.SCAllReward[scHash][headerNumber.Uint64()] = make(map[common.Address]uint64)
+		}
+		confirmedNumber, confirmedCoinbase := s.calculateConfirmedNumber(record, minConfirmedSignerCount)
+		if confirmedNumber > record.LastConfirmedNumber {
+			// todo: map coinbase of side chain to coin base of main chain here
+			lastSCCoinbase := common.Address{}
+			currentSCCoinbaseCount := uint64(0)
+			for n := record.LastConfirmedNumber + 1; n <= confirmedNumber; n++ {
+				if scCoinbase, ok := confirmedCoinbase[n]; ok {
+					// if scCoinbase not same with lastSCCoinbase recount
+					if lastSCCoinbase != scCoinbase {
+						currentSCCoinbaseCount = 1
+					} else {
+						currentSCCoinbaseCount++
+					}
+
+					if _, ok := s.SCAllReward[scHash][headerNumber.Uint64()][scCoinbase]; !ok {
+						s.SCAllReward[scHash][headerNumber.Uint64()][scCoinbase] = s.calculateCurrentBlockReward(currentSCCoinbaseCount, record.CountPerPeriod)
+					} else {
+						s.SCAllReward[scHash][headerNumber.Uint64()][scCoinbase] += s.calculateCurrentBlockReward(currentSCCoinbaseCount, record.CountPerPeriod)
+					}
+
+					// update lastSCCoinbase
+					lastSCCoinbase = scCoinbase
+				}
+			}
+
+			for i := record.LastConfirmedNumber + 1; i <= confirmedNumber; i++ {
+				if _, ok := s.SCConfirmation[scHash].Record[i]; ok {
+					delete(s.SCConfirmation[scHash].Record, i)
+				}
+			}
+			s.SCConfirmation[scHash].LastConfirmedNumber = confirmedNumber
+		}
+		// clear empty block number for side chain
+		if len(s.SCAllReward[scHash][headerNumber.Uint64()]) == 0 {
+			delete(s.SCAllReward[scHash], headerNumber.Uint64())
+		}
+	}
+
+	for scHash, _ := range s.SCAllReward {
+		// clear expired side chain reward record
+		for number, _ := range s.SCAllReward[scHash] {
+			if number < headerNumber.Uint64()-scRewardExpiredLoopCount*s.config.MaxSignerCount {
+				delete(s.SCAllReward[scHash], number)
+			}
+		}
+		// clear this side chain if reward is empty
+		if len(s.SCAllReward[scHash]) == 0 {
+			delete(s.SCAllReward, scHash)
+		}
+	}
+
+}
+
 func (s *Snapshot) updateSnapshotByDeclares(declares []Declare, headerNumber *big.Int) {
 	for _, declare := range declares {
 		if proposal, ok := s.Proposals[declare.ProposalHash]; ok {
 			// check the proposal enable status and valid block number
-			if proposal.ReceivedNumber.Uint64()+proposal.ValidationLoopCnt*s.config.MaxSignerCount < headerNumber.Uint64() || proposal.Enable || !s.isCandidate(declare.Declarer) {
+			if proposal.ReceivedNumber.Uint64()+proposal.ValidationLoopCnt*s.config.MaxSignerCount < headerNumber.Uint64() || !s.isCandidate(declare.Declarer) {
 				continue
 			}
 			// check if this signer already declare on this proposal
@@ -323,6 +585,15 @@ func (s *Snapshot) updateSnapshotByDeclares(declares []Declare, headerNumber *bi
 			s.Proposals[declare.ProposalHash].Declares = append(s.Proposals[declare.ProposalHash].Declares,
 				&Declare{declare.ProposalHash, declare.Declarer, declare.Decision})
 
+		}
+	}
+}
+
+func (s *Snapshot) calculateProposalResult(headerNumber *big.Int) {
+
+	for hashKey, proposal := range s.Proposals {
+		// the result will be calculate at receiverdNumber + vlcnt + 1
+		if proposal.ReceivedNumber.Uint64()+proposal.ValidationLoopCnt*s.config.MaxSignerCount+1 == headerNumber.Uint64() {
 			// calculate the current stake of this proposal
 			judegmentStake := big.NewInt(0)
 			for _, tally := range s.Tally {
@@ -334,26 +605,44 @@ func (s *Snapshot) updateSnapshotByDeclares(declares []Declare, headerNumber *bi
 			yesDeclareStake := big.NewInt(0)
 			for _, declare := range proposal.Declares {
 				if declare.Decision {
-					yesDeclareStake.Add(yesDeclareStake, s.Tally[declare.Declarer])
+					if _, ok := s.Tally[declare.Declarer]; ok {
+						yesDeclareStake.Add(yesDeclareStake, s.Tally[declare.Declarer])
+					}
 				}
 			}
 			if yesDeclareStake.Cmp(judegmentStake) > 0 {
-				s.Proposals[declare.ProposalHash].Enable = true
 				// process add candidate
 				switch proposal.ProposalType {
 				case proposalTypeCandidateAdd:
-					s.Candidates[s.Proposals[declare.ProposalHash].Candidate] = candidateNormal
+					if candidateNeedPD {
+						s.Candidates[proposal.Candidate] = candidateStateNormal
+					}
 				case proposalTypeCandidateRemove:
-					if _, ok := s.Candidates[proposal.Candidate]; ok {
+					if _, ok := s.Candidates[proposal.Candidate]; ok && candidateNeedPD {
 						delete(s.Candidates, proposal.Candidate)
 					}
 				case proposalTypeMinerRewardDistributionModify:
-					minerRewardPerThousand = s.Proposals[declare.ProposalHash].MinerRewardPerThousand
+					minerRewardPerThousand = s.Proposals[hashKey].MinerRewardPerThousand
 
+				case proposalTypeSideChainAdd:
+					if _, ok := s.SCConfirmation[proposal.SCHash]; !ok {
+						s.SCConfirmation[proposal.SCHash] = &SCRecord{make(map[uint64][]*SCConfirmation), 0, 0, proposal.SCBlockCountPerPeriod, proposal.SCBlockRewardPerPeriod}
+					}
+				case proposalTypeSideChainRemove:
+					if _, ok := s.SCConfirmation[proposal.SCHash]; ok {
+						delete(s.SCConfirmation, proposal.SCHash)
+					}
 				}
+			} else {
+				// reach the target header number, but not success
+				// remove the fail proposal
+				delete(s.Proposals, hashKey)
 			}
+
 		}
+
 	}
+
 }
 
 func (s *Snapshot) updateSnapshotByProposals(proposals []Proposal, headerNumber *big.Int) {
@@ -397,6 +686,9 @@ func (s *Snapshot) updateSnapshotForExpired() {
 	// remove 0 stake tally
 	for address, tally := range s.Tally {
 		if tally.Cmp(big.NewInt(0)) <= 0 {
+			if _, ok := s.SCCoinbase[address]; ok {
+				delete(s.SCCoinbase, address)
+			}
 			delete(s.Tally, address)
 		}
 	}
@@ -434,6 +726,9 @@ func (s *Snapshot) updateSnapshotByVotes(votes []Vote, headerNumber *big.Int) {
 			s.Tally[vote.Candidate].Add(s.Tally[vote.Candidate], vote.Stake)
 		} else {
 			s.Tally[vote.Candidate] = vote.Stake
+			if !candidateNeedPD {
+				s.Candidates[vote.Candidate] = candidateStateNormal
+			}
 		}
 
 		s.Votes[vote.Voter] = &Vote{vote.Voter, vote.Candidate, vote.Stake}
@@ -517,9 +812,7 @@ func (s *Snapshot) isVoter(address common.Address) bool {
 
 // check if address belong to candidate
 func (s *Snapshot) isCandidate(address common.Address) bool {
-	if !candidateFromPOA {
-		return true
-	} else if _, ok := s.Candidates[address]; ok {
+	if _, ok := s.Candidates[address]; ok {
 		return true
 	}
 	return false
@@ -564,8 +857,7 @@ func (s *Snapshot) getLastConfirmedBlockNumber(confirmations []Confirmation) *bi
 	return big.NewInt(int64(i))
 }
 
-func (s *Snapshot) calculateReward(coinbase common.Address, votersReward *big.Int) map[common.Address]*big.Int {
-
+func (s *Snapshot) calculateVoteReward(coinbase common.Address, votersReward *big.Int) map[common.Address]*big.Int {
 	rewards := make(map[common.Address]*big.Int)
 	allStake := big.NewInt(0)
 	for voter, vote := range s.Votes {
@@ -578,5 +870,43 @@ func (s *Snapshot) calculateReward(coinbase common.Address, votersReward *big.In
 		stake.Mul(stake, votersReward)
 		stake.Div(stake, allStake)
 	}
+
 	return rewards
+}
+
+func (s *Snapshot) calculateSCReward(minerReward *big.Int) map[common.Address]*big.Int {
+	// rewards for side chain
+	if s.config.IsTrantor(new(big.Int).SetUint64(s.Number)) {
+		// need to deal with sum of record.RewardPerPeriod for all side chain is larger than 100% situation
+		scRewardSum := big.NewInt(0)
+		for _, record := range s.SCConfirmation {
+			scRewardSum.Add(scRewardSum, new(big.Int).SetUint64(record.RewardPerPeriod))
+		}
+		if scRewardSum.Uint64() < 1000 {
+			scRewardSum.SetUint64(1000)
+		}
+
+		rewards := make(map[common.Address]*big.Int)
+		for scHash, scReward := range s.SCAllReward {
+			// check reward for the block number is exist
+			if reward, ok := scReward[s.Number-scRewardDelayLoopCount*s.config.MaxSignerCount]; ok {
+				// check confirm is exist, to get countPerPeriod and rewardPerPeriod
+				if confirmation, ok := s.SCConfirmation[scHash]; ok {
+					// calculate the side chain reward base on RewardPerPeriod(/100) and record.RewardPerPeriod
+					for addr, scre := range reward {
+						singleReward := new(big.Int).SetUint64(scre * confirmation.RewardPerPeriod)
+						singleReward.Div(singleReward, scRewardSum)
+						singleReward.Mul(singleReward, minerReward)
+						if _, ok := rewards[addr]; ok {
+							rewards[addr].Add(rewards[addr], singleReward)
+						} else {
+							rewards[addr] = singleReward
+						}
+					}
+				}
+			}
+		}
+		return rewards
+	}
+	return nil
 }

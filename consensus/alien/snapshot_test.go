@@ -1,4 +1,4 @@
-// Copyright 2017 The gttc Authors
+// Copyright 2018 The gttc Authors
 // This file is part of the gttc library.
 //
 // The gttc library is free software: you can redistribute it and/or modify
@@ -31,7 +31,6 @@ import (
 	"github.com/TTCECO/gttc/crypto"
 	"github.com/TTCECO/gttc/ethdb"
 	"github.com/TTCECO/gttc/params"
-	"github.com/TTCECO/gttc/rlp"
 )
 
 type testerTransaction struct {
@@ -133,7 +132,7 @@ func TestVoting(t *testing.T) {
 	// Define the various voting scenarios to test
 	tests := []struct {
 		addrNames        []string             // accounts used in this case
-		candidatePOA     bool                 // candidate from POA
+		candidateNeedPD  bool                 // candidate from POA
 		period           uint64               // default 3
 		epoch            uint64               // default 30000
 		maxSignerCount   uint64               // default 5 for test
@@ -143,6 +142,7 @@ func TestVoting(t *testing.T) {
 		selfVoters       []testerSelfVoter    //
 		txHeaders        []testerSingleHeader //
 		result           testerSnapshot       // the result of current snapshot
+		vlCnt            uint64
 	}{
 		{
 			/* 	Case 0:
@@ -645,7 +645,7 @@ func TestVoting(t *testing.T) {
 			* 	C vote D to be signer in block 3, but D is not in candidates ,so this vote not valid
 			 */
 			addrNames:        []string{"A", "B", "C", "D"},
-			candidatePOA:     true,
+			candidateNeedPD:  true,
 			period:           uint64(3),
 			epoch:            uint64(31),
 			maxSignerCount:   uint64(5),
@@ -680,7 +680,7 @@ func TestVoting(t *testing.T) {
 			* 	C vote D to be signer in block 3, but D is not in candidates ,so this vote not valid
 			 */
 			addrNames:        []string{"A", "B", "C", "D"},
-			candidatePOA:     true,
+			candidateNeedPD:  true,
 			period:           uint64(3),
 			epoch:            uint64(31),
 			maxSignerCount:   uint64(5),
@@ -719,7 +719,7 @@ func TestVoting(t *testing.T) {
 			* 	C vote D to be signer in block 5
 			 */
 			addrNames:        []string{"A", "B", "C", "D"},
-			candidatePOA:     true,
+			candidateNeedPD:  true,
 			period:           uint64(3),
 			epoch:            uint64(31),
 			maxSignerCount:   uint64(5),
@@ -732,6 +732,12 @@ func TestVoting(t *testing.T) {
 				{[]testerTransaction{{from: "A", to: "A", isProposal: true, candidate: "D", txHash: "a", proposalType: proposalTypeCandidateAdd}}},
 				{[]testerTransaction{{from: "A", to: "A", isDeclare: true, txHash: "a", decision: true}, {from: "B", to: "B", isDeclare: true, txHash: "a", decision: true}}},
 				{[]testerTransaction{}},
+				{[]testerTransaction{}},
+				{[]testerTransaction{}},
+				{[]testerTransaction{}},
+				{[]testerTransaction{}},
+				{[]testerTransaction{}},
+				{[]testerTransaction{}},
 				{[]testerTransaction{{from: "C", to: "D", balance: 250, isVote: true}}},
 				{[]testerTransaction{}},
 				{[]testerTransaction{}},
@@ -743,7 +749,7 @@ func TestVoting(t *testing.T) {
 			result: testerSnapshot{
 				Signers: []string{"A", "B", "D"},
 				Tally:   map[string]int{"A": 100, "B": 200, "D": 250},
-				Voters:  map[string]int{"A": 0, "B": 0, "C": 5},
+				Voters:  map[string]int{"A": 0, "B": 0, "C": 11},
 				Votes: map[string]*testerVote{
 					"A": {"A", "A", 100},
 					"B": {"B", "B", 200},
@@ -760,7 +766,7 @@ func TestVoting(t *testing.T) {
 			* 	C vote D to be signer in block 5
 			 */
 			addrNames:        []string{"A", "B", "C", "D", "E", "F"},
-			candidatePOA:     true,
+			candidateNeedPD:  true,
 			period:           uint64(3),
 			epoch:            uint64(31),
 			maxSignerCount:   uint64(5),
@@ -802,7 +808,7 @@ func TestVoting(t *testing.T) {
 			*   Now do not change the vote automatically,
 			 */
 			addrNames:        []string{"A", "B", "C", "D", "E", "F"},
-			candidatePOA:     true,
+			candidateNeedPD:  true,
 			period:           uint64(3),
 			epoch:            uint64(31),
 			maxSignerCount:   uint64(5),
@@ -838,7 +844,10 @@ func TestVoting(t *testing.T) {
 
 	// Run through the scenarios and test them
 	for i, tt := range tests {
-		candidateFromPOA = tt.candidatePOA
+		candidateNeedPD = tt.candidateNeedPD
+		if tt.vlCnt == 0 {
+			tt.vlCnt = 1
+		}
 		// Create the account pool and generate the initial set of all address in addrNames
 		accounts := newTesterAccountPool()
 		addrNames := make([]common.Address, len(tt.addrNames))
@@ -886,6 +895,7 @@ func TestVoting(t *testing.T) {
 			MinVoterBalance: big.NewInt(int64(tt.minVoterBalance)),
 			MaxSignerCount:  tt.maxSignerCount,
 			SelfVoteSigners: selfVoteSigners,
+			TrantorBlock:    big.NewInt(1),
 		}, db)
 
 		// Assemble a chain of headers from the cast votes
@@ -898,7 +908,7 @@ func TestVoting(t *testing.T) {
 			var modifyPredecessorVotes []Vote
 			for _, trans := range header.txs {
 				if trans.isVote {
-					if trans.balance >= tt.minVoterBalance && snap.isCandidate(accounts.address(trans.to)) {
+					if trans.balance >= tt.minVoterBalance && (!candidateNeedPD || snap.isCandidate(accounts.address(trans.to))) {
 						// vote event
 						currentBlockVotes = append(currentBlockVotes, Vote{
 							Voter:     accounts.address(trans.from),
@@ -910,14 +920,14 @@ func TestVoting(t *testing.T) {
 					if snap.isCandidate(accounts.address(trans.from)) {
 						currentBlockProposals = append(currentBlockProposals, Proposal{
 							Hash:                   common.HexToHash(trans.txHash),
-							ValidationLoopCnt:      defaultValidationLoopCnt,
-							ImplementNumber:        big.NewInt(1),
-							DecisionType:           decisionTypeImmediately,
+							ValidationLoopCnt:      tt.vlCnt,
 							ProposalType:           trans.proposalType,
 							Proposer:               accounts.address(trans.from),
 							Candidate:              accounts.address(trans.candidate),
 							MinerRewardPerThousand: minerRewardPerThousand,
-							Enable:                 false,
+							SCHash:                 common.Hash{},
+							SCBlockCountPerPeriod:  1,
+							SCBlockRewardPerPeriod: 0,
 							Declares:               []*Declare{},
 							ReceivedNumber:         big.NewInt(int64(j)),
 						})
@@ -955,7 +965,9 @@ func TestVoting(t *testing.T) {
 
 			} else {
 				// decode parent header.extra
-				rlp.DecodeBytes(headers[j-1].Extra[extraVanity:len(headers[j-1].Extra)-extraSeal], &currentHeaderExtra)
+				//rlp.DecodeBytes(headers[j-1].Extra[extraVanity:len(headers[j-1].Extra)-extraSeal], &currentHeaderExtra)
+
+				decodeHeaderExtra(alien.config, headers[j-1].Number, headers[j-1].Extra[extraVanity:len(headers[j-1].Extra)-extraSeal], &currentHeaderExtra)
 				signer = currentHeaderExtra.SignerQueue[uint64(j)%tt.maxSignerCount]
 				// means header.Number % tt.maxSignerCount == 0
 				if (j+1)%int(tt.maxSignerCount) == 0 {
@@ -981,7 +993,9 @@ func TestVoting(t *testing.T) {
 			currentHeaderExtra.ModifyPredecessorVotes = modifyPredecessorVotes
 			currentHeaderExtra.CurrentBlockProposals = currentBlockProposals
 			currentHeaderExtra.CurrentBlockDeclares = currentBlockDeclares
-			currentHeaderExtraEnc, err := rlp.EncodeToBytes(currentHeaderExtra)
+			//currentHeaderExtraEnc, err := rlp.EncodeToBytes(currentHeaderExtra)
+			currentHeaderExtraEnc, err := encodeHeaderExtra(alien.config, big.NewInt(int64(j)+1), currentHeaderExtra)
+
 			if err != nil {
 				t.Errorf("test %d: failed to rlp encode to bytes: %v", i, err)
 				continue
